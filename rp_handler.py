@@ -502,26 +502,26 @@ def _build_diarizer(
 def _segments_from_result(result, time_offset_s: float = 0.0, speaker_id_offset: int = 0) -> list[dict]:
     """Convert sherpa_onnx diarization result segments to dict list.
 
-    Handles API variations across sherpa-onnx versions:
-      - New API (>=1.10): result.segments is a list of objects with .start/.end/.speaker
-      - Some versions: result itself is directly iterable (the segment list)
-    Logs dir(result) on failure so the correct API can be identified in RunPod logs.
+    The sherpa-onnx Python API returns an OfflineSpeakerDiarizationResult from
+    diarizer.process(). Segments are retrieved via result.sort_by_start_time(),
+    which returns a list of OfflineSpeakerDiarizationSegment objects each with
+    .start, .end, and .speaker (integer index).
     """
     result_type = type(result).__name__
     public_attrs = [a for a in dir(result) if not a.startswith("_")]
     log.info("Diarization result type: %s | public attrs: %s", result_type, public_attrs)
 
-    # Resolve raw segment iterable — try .segments property first, then direct iteration
-    if hasattr(result, "segments"):
+    # Primary API: result.sort_by_start_time() — official sherpa-onnx Python examples
+    if hasattr(result, "sort_by_start_time"):
+        raw_segs = result.sort_by_start_time()
+    elif hasattr(result, "segments"):
         raw_segs = result.segments
     elif hasattr(result, "__iter__") and not isinstance(result, (str, bytes, np.ndarray)):
         raw_segs = list(result)
     else:
         raise AttributeError(
             f"Cannot extract segments from sherpa_onnx result of type {result_type}. "
-            f"Available public attrs: {public_attrs}. "
-            f"Please pin a sherpa-onnx version whose OfflineSpeakerDiarizationResult "
-            f"exposes .segments."
+            f"Available attrs: {public_attrs}"
         )
 
     out = []
