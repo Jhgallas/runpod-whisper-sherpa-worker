@@ -65,7 +65,7 @@ RUN python3 -c "from faster_whisper import WhisperModel; \
 RUN python3 -c "from faster_whisper import WhisperModel; \
     WhisperModel('base.en', device='cpu', download_root='/app/whisper_models')"
 RUN python3 -c "from faster_whisper import WhisperModel; \
-    WhisperModel('small.en', device='cpu', download_root='/app/whisper_models')"}
+    WhisperModel('small.en', device='cpu', download_root='/app/whisper_models')"
 
 # ── Diarization ONNX models ────────────────────────────────────────────────────
 # Source: app/src/main/assets/diarization/ (or downloaded via prepare_models.sh)
