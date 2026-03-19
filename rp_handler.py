@@ -492,19 +492,49 @@ def _get_ort_sessions():
     Load (once) ORT inference sessions for segmentation + embedding models.
     Returns (seg_session, emb_session, provider_str) where provider_str is
     "CUDA" or "CPU".
+
+    Model selection for the ORT path:
+      - Segmentation: model.onnx (FP32) preferred over model.int8.onnx.
+        INT8 quantised ops are not fully supported by the CUDA ExecutionProvider
+        and cause silent node-level fallback to CPU, defeating GPU acceleration.
+        FP32 runs entirely on CUDA with no fallbacks.
+      - Embedding: nemo_en_titanet_small.onnx (already FP32 in the Android AAR).
     """
     global _ort_seg_session, _ort_emb_session, _ort_provider
     if _ort_seg_session is not None:
         return _ort_seg_session, _ort_emb_session, _ort_provider
 
-    seg_path = os.path.join(
+    # Prefer FP32 segmentation model for full CUDA EP coverage.
+    seg_path_fp32 = os.path.join(
+        DIARIZATION_MODEL_DIR, "pyannote-segmentation-3-0", "model.onnx"
+    )
+    seg_path_int8 = os.path.join(
         DIARIZATION_MODEL_DIR, "pyannote-segmentation-3-0", "model.int8.onnx"
     )
+    if os.path.exists(seg_path_fp32):
+        seg_path = seg_path_fp32
+        log.info("ORT: using FP32 segmentation model (full CUDA coverage)")
+    else:
+        seg_path = seg_path_int8
+        log.warning(
+            "ORT: FP32 model not found at %s — using INT8. "
+            "INT8 ops may silently fall back to CPU inside CUDA EP. "
+            "Copy model.onnx to %s for guaranteed GPU usage.",
+            seg_path_fp32,
+            os.path.dirname(seg_path_fp32),
+        )
     emb_path = os.path.join(DIARIZATION_MODEL_DIR, "nemo_en_titanet_small.onnx")
 
     cuda_ok = _ort_cuda_available()
+    # Explicit CUDA provider options: device 0, arena-based allocator
+    cuda_provider_opts = {
+        "device_id": 0,
+        "arena_extend_strategy": "kNextPowerOfTwo",
+        "cudnn_conv_algo_search": "EXHAUSTIVE",
+        "do_copy_in_default_stream": True,
+    }
     providers = (
-        ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        [("CUDAExecutionProvider", cuda_provider_opts), "CPUExecutionProvider"]
         if cuda_ok
         else ["CPUExecutionProvider"]
     )
@@ -539,6 +569,14 @@ def _get_ort_sessions():
         log.info("ORT emb  output %-20s shape=%s type=%s", out.name, out.shape, out.type)
 
     actual = "CUDA" if (cuda_ok and seg_prov[0] == "CUDAExecutionProvider") else "CPU"
+    if cuda_ok and actual != "CUDA":
+        log.warning(
+            "ORT: CUDA was requested but session is running on %s. "
+            "Actual providers: seg=%s emb=%s. "
+            "This usually means the segmentation model contains INT8 ops unsupported "
+            "by the CUDA EP — ensure model.onnx (FP32) is present in the models dir.",
+            actual, seg_prov, emb_prov,
+        )
     _ort_provider = actual
     _ort_seg_session = seg_session
     _ort_emb_session = emb_session

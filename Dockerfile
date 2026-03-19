@@ -76,6 +76,12 @@ RUN python3 -c "from faster_whisper import WhisperModel; \
 # ── Diarization ONNX models ────────────────────────────────────────────────────
 # Source: app/src/main/assets/diarization/ (or downloaded via prepare_models.sh)
 # Checksums must match the Android AAR assets for numerical parity.
+#
+# Both model variants must be present in models/pyannote-segmentation-3-0/:
+#   model.onnx      — FP32, used by ORT CUDA path (all ops run on CUDA EP)
+#   model.int8.onnx — INT8, used by sherpa-onnx CPU fallback
+# If only model.int8.onnx is present, ORT will warn and INT8 ops may fall back
+# to CPU even when CUDA EP is selected.
 COPY models/pyannote-segmentation-3-0/ /app/models/pyannote-segmentation-3-0/
 COPY models/nemo_en_titanet_small.onnx /app/models/
 ENV DIARIZATION_MODEL_DIR=/app/models
