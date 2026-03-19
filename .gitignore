@@ -159,10 +159,7 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Diarization ONNX models (large binary files; populate via prepare_models.sh)
-models/
-
-# Whisper model cache (baked into Docker image; large files)
+# Whisper model cache (baked into Docker image at build time; large files)
 local_whisper_cache/
 
 # Local test audio
