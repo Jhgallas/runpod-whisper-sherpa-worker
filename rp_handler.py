@@ -112,7 +112,7 @@ def _gpu_available() -> bool:
         return False
 
 CPU_ONLY: bool = not _gpu_available()
-COMPUTE_TYPE: str = "int8" if CPU_ONLY else "int8_float16"
+COMPUTE_TYPE: str = "int8"  # int8 works on all CUDA devices; int8_float16 requires Volta+
 log.info("Runtime: %s (compute_type=%s)", "CPU" if CPU_ONLY else "GPU/CUDA", COMPUTE_TYPE)
 
 # ── Lazily-cached Whisper models (loaded once per worker process) ──────────────
