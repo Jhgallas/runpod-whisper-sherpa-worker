@@ -129,6 +129,73 @@ CPU_ONLY: bool = not _gpu_available()
 COMPUTE_TYPE: str = "int8"  # int8 works on all CUDA devices; int8_float16 requires Volta+
 log.info("Runtime: %s (compute_type=%s)", "CPU" if CPU_ONLY else "GPU/CUDA", COMPUTE_TYPE)
 
+
+def _get_worker_info() -> dict:
+    """
+    Collect RunPod worker environment and GPU hardware info for cost/billing analysis.
+
+    Cost calculation:
+      billed_s  = executionTime_ms / 1000  (from RunPod API response — caller-side only)
+      cost_usd  = billed_s * gpu_price_per_second
+      GPU price per second: look up gpu_name at https://www.runpod.io/serverless-gpu-pricing
+
+    Note: delayTime (queue wait) and executionTime are only visible in the RunPod API
+    response envelope and cannot be read from inside the worker container.
+    """
+    info: dict = {}
+
+    # RunPod-injected environment variables
+    for env_key, out_key in [
+        ("RUNPOD_POD_ID",      "pod_id"),
+        ("RUNPOD_ENDPOINT_ID", "endpoint_id"),
+        ("RUNPOD_GPU_COUNT",   "gpu_count_env"),
+        ("RUNPOD_CPU_COUNT",   "cpu_count_env"),
+        ("RUNPOD_MEM_GB",      "mem_gb_env"),
+    ]:
+        val = os.environ.get(env_key, "")
+        if val:
+            info[out_key] = val
+
+    # Python-visible CPU count
+    try:
+        info["cpu_count"] = os.cpu_count()
+    except Exception:
+        pass
+
+    # GPU hardware via nvidia-smi
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total,driver_version,cuda_version",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            gpus = []
+            for line in result.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 4:
+                    gpus.append({
+                        "name": parts[0],
+                        "memory_mb": int(parts[1]) if parts[1].isdigit() else parts[1],
+                        "driver_version": parts[2],
+                        "cuda_version": parts[3],
+                    })
+            if gpus:
+                info["gpus"] = gpus
+    except Exception as exc:
+        log.debug("nvidia-smi unavailable: %s", exc)
+
+    return info
+
+
+# ── Worker info (collected once at module load) ────────────────────────────────
+
+WORKER_INFO: dict = _get_worker_info()
+log.info("Worker info: %s", WORKER_INFO)
+
 # ── Lazily-cached Whisper models (loaded once per worker process) ──────────────
 
 _whisper_cache: dict[str, WhisperModel] = {}
@@ -1316,7 +1383,8 @@ def handler(event: dict) -> dict:
     Input / output contract: see agent_prompt_runpod_parity_worker.md
     """
     job_start = time.time()
-    log.info("=== Job start ===")
+    job_id: str = event.get("id", "unknown")
+    log.info("=== Job start === (job_id=%s)", job_id)
 
     # ── Input validation ──────────────────────────────────────────────────────
     if not event or "input" not in event:
@@ -1547,6 +1615,8 @@ def handler(event: dict) -> dict:
             "diarization_mode": diarization_mode,
             "cpu_only": CPU_ONLY,
             "timing": timing,
+            "job_id": job_id,
+            "worker": WORKER_INFO,
             "sherpa_onnx_version": getattr(sherpa_onnx, "__version__", "unknown") if SHERPA_AVAILABLE else "unavailable",
         }
         gist_files[f"{recording_id}_run_summary.json"] = json.dumps(run_summary, indent=2)
