@@ -62,6 +62,20 @@ except ImportError:
     logging.warning("sherpa_onnx not available — diarization will be skipped")
 
 try:
+    import onnxruntime as ort
+    ORT_AVAILABLE = True
+except ImportError:
+    ORT_AVAILABLE = False
+    logging.warning("onnxruntime not available — ORT diarization path disabled")
+
+try:
+    import kaldi_native_fbank as knf
+    KNF_AVAILABLE = True
+except ImportError:
+    KNF_AVAILABLE = False
+    logging.warning("kaldi_native_fbank not available — falling back to scipy mel features")
+
+try:
     from langdetect import detect_langs, LangDetectException
     LANGDETECT_AVAILABLE = True
 except ImportError:
@@ -458,7 +472,531 @@ def transcribe_audio(
     return transcript_lines, segment_metadata, info.language, info.language_probability
 
 
-# ── Diarization ────────────────────────────────────────────────────────────────
+# ── ORT CUDA diarization ──────────────────────────────────────────────────────
+
+# Cached ORT sessions (loaded once per worker process)
+_ort_seg_session = None
+_ort_emb_session = None
+_ort_provider: Optional[str] = None
+
+
+def _ort_cuda_available() -> bool:
+    """Return True if onnxruntime CUDAExecutionProvider is accessible."""
+    if not ORT_AVAILABLE:
+        return False
+    return "CUDAExecutionProvider" in ort.get_available_providers()
+
+
+def _get_ort_sessions():
+    """
+    Load (once) ORT inference sessions for segmentation + embedding models.
+    Returns (seg_session, emb_session, provider_str) where provider_str is
+    "CUDA" or "CPU".
+    """
+    global _ort_seg_session, _ort_emb_session, _ort_provider
+    if _ort_seg_session is not None:
+        return _ort_seg_session, _ort_emb_session, _ort_provider
+
+    seg_path = os.path.join(
+        DIARIZATION_MODEL_DIR, "pyannote-segmentation-3-0", "model.int8.onnx"
+    )
+    emb_path = os.path.join(DIARIZATION_MODEL_DIR, "nemo_en_titanet_small.onnx")
+
+    cuda_ok = _ort_cuda_available()
+    providers = (
+        ["CUDAExecutionProvider", "CPUExecutionProvider"]
+        if cuda_ok
+        else ["CPUExecutionProvider"]
+    )
+    log.info("ORT: initialising sessions (preferred providers: %s)", providers)
+
+    sess_opts = ort.SessionOptions()
+    sess_opts.inter_op_num_threads = 4
+    sess_opts.intra_op_num_threads = 4
+
+    seg_session = ort.InferenceSession(seg_path, sess_options=sess_opts, providers=providers)
+    emb_session = ort.InferenceSession(emb_path, sess_options=sess_opts, providers=providers)
+
+    # Log actual providers chosen by ORT
+    seg_prov = seg_session.get_providers()
+    emb_prov = emb_session.get_providers()
+    log.info("ORT segmentation providers: %s", seg_prov)
+    log.info("ORT embedding   providers: %s", emb_prov)
+
+    # Log model metadata so timing data is unambiguous
+    seg_meta = seg_session.get_modelmeta().custom_metadata_map
+    emb_meta = emb_session.get_modelmeta().custom_metadata_map
+    log.info("ORT seg model metadata: %s", seg_meta)
+    log.info("ORT emb model metadata: %s", emb_meta)
+
+    for inp in seg_session.get_inputs():
+        log.info("ORT seg  input  %-20s shape=%s type=%s", inp.name, inp.shape, inp.type)
+    for out in seg_session.get_outputs():
+        log.info("ORT seg  output %-20s shape=%s type=%s", out.name, out.shape, out.type)
+    for inp in emb_session.get_inputs():
+        log.info("ORT emb  input  %-20s shape=%s type=%s", inp.name, inp.shape, inp.type)
+    for out in emb_session.get_outputs():
+        log.info("ORT emb  output %-20s shape=%s type=%s", out.name, out.shape, out.type)
+
+    actual = "CUDA" if (cuda_ok and seg_prov[0] == "CUDAExecutionProvider") else "CPU"
+    _ort_provider = actual
+    _ort_seg_session = seg_session
+    _ort_emb_session = emb_session
+    log.info("ORT: diarization will run on %s", actual)
+    return _ort_seg_session, _ort_emb_session, _ort_provider
+
+
+def _build_powerset_map(num_speakers: int, powerset_max_classes: int) -> list:
+    """
+    Map each powerset class index → frozenset of active speaker indices.
+
+    Class 0 = empty set (no speaker active).
+    Follows the pyannote-audio PowersetActivation enumeration used when exporting
+    pyannote/segmentation-3.0 to ONNX (same scheme as sherpa-onnx expects).
+    """
+    from itertools import combinations
+    mapping: list = [frozenset()]
+    for k in range(1, powerset_max_classes + 1):
+        for combo in combinations(range(num_speakers), k):
+            mapping.append(frozenset(combo))
+    return mapping
+
+
+def _run_pyannote_ort(
+    seg_session,
+    samples: np.ndarray,
+    num_speakers: int,
+    powerset_max_classes: int,
+    window_size: int,
+    window_shift: int,
+    sr: int = SAMPLE_RATE,
+) -> list:
+    """
+    Slide a window over `samples`, run the pyannote segmentation ONNX model in
+    each window, decode powerset output to per-speaker binary activity, and
+    return a flat list of (start_s, end_s, unique_speaker_id) tuples.
+
+    unique_speaker_id is window-local: it uniquely identifies a speaker within
+    a window but NOT across windows.  FastClustering later assigns global IDs
+    based on embedding similarity.
+    """
+    powerset_map = _build_powerset_map(num_speakers, powerset_max_classes)
+    input_name = seg_session.get_inputs()[0].name
+
+    n = len(samples)
+    raw_segs: list = []
+    speaker_id_offset = 0
+    window_count = 0
+    start_idx = 0
+
+    while start_idx < n:
+        end_idx = min(start_idx + window_size, n)
+        chunk = samples[start_idx:end_idx].copy()
+        if len(chunk) < window_size:
+            chunk = np.pad(chunk, (0, window_size - len(chunk)), mode="constant")
+
+        chunk_start_s = start_idx / sr
+
+        # Run segmentation model: input [1, 1, window_size]
+        x = chunk[np.newaxis, np.newaxis, :].astype(np.float32)
+        output = seg_session.run(None, {input_name: x})
+        probs = output[0][0]  # [T, num_classes]
+        T = probs.shape[0]
+        # seconds per output frame
+        frame_step_s = (window_size / sr) / T  # ≈ 17 ms for pyannote v3
+
+        # Decode powerset classes → per-speaker binary activity [T, num_speakers]
+        classes = np.argmax(probs, axis=-1)  # [T]
+        activity = np.zeros((T, num_speakers), dtype=bool)
+        for t_idx, cls in enumerate(classes):
+            if cls < len(powerset_map):
+                for spk in powerset_map[cls]:
+                    activity[t_idx, spk] = True
+
+        # Convert frame-level activity to time intervals per local speaker
+        for local_spk in range(num_speakers):
+            spk_act = activity[:, local_spk]
+            padded = np.concatenate([[False], spk_act, [False]])
+            diff = np.diff(padded.astype(np.int8))
+            seg_starts = np.where(diff == 1)[0]
+            seg_ends = np.where(diff == -1)[0]
+            for fs, fe in zip(seg_starts, seg_ends):
+                s = chunk_start_s + fs * frame_step_s
+                e = chunk_start_s + fe * frame_step_s
+                e = min(e, n / sr)
+                if e > s:
+                    raw_segs.append((s, e, speaker_id_offset + local_spk))
+
+        speaker_id_offset += num_speakers
+        window_count += 1
+        if end_idx >= n:
+            break
+        start_idx += window_shift
+
+    log.info(
+        "ORT segmentation: %d windows → %d raw speaker intervals",
+        window_count, len(raw_segs),
+    )
+    return raw_segs
+
+
+def _mel_filterbank(
+    sr: int, n_fft: int, n_mels: int, fmin: float, fmax: float
+) -> np.ndarray:
+    """Triangular mel filterbank matrix [n_mels, n_fft//2+1] using HTK mel scale."""
+    def hz_to_mel(f: float) -> float:
+        return 2595.0 * np.log10(1.0 + f / 700.0)
+    def mel_to_hz(m: float) -> float:
+        return 700.0 * (10.0 ** (m / 2595.0) - 1.0)
+
+    mel_pts = np.linspace(hz_to_mel(fmin), hz_to_mel(fmax), n_mels + 2)
+    hz_pts = np.array([mel_to_hz(m) for m in mel_pts])
+    freqs = np.fft.rfftfreq(n_fft, d=1.0 / sr)
+    bins = np.array([np.argmin(np.abs(freqs - f)) for f in hz_pts], dtype=np.int32)
+
+    fb = np.zeros((n_mels, n_fft // 2 + 1), dtype=np.float32)
+    for m in range(n_mels):
+        left, center, right = bins[m], bins[m + 1], bins[m + 2]
+        if center > left:
+            fb[m, left : center + 1] = np.linspace(0.0, 1.0, center - left + 1)
+        if right > center:
+            fb[m, center : right + 1] = np.linspace(1.0, 0.0, right - center + 1)
+    return fb
+
+
+def _compute_nemo_fbank(
+    audio: np.ndarray,
+    n_mels: int = 80,
+    sr: int = SAMPLE_RATE,
+) -> np.ndarray:
+    """
+    Log mel filterbank features matching sherpa-onnx's NeMo/TitaNet feature
+    extraction (kaldi-style: hanning window, 25 ms frames, 10 ms shift,
+    power spectrogram, per-feature mean/std normalisation).
+
+    Uses kaldi_native_fbank when available (most accurate match to
+    sherpa-onnx's internal implementation).  Falls back to a scipy/numpy
+    re-implementation otherwise.
+
+    Returns: float32 [n_mels, n_frames]
+    """
+    audio_f32 = audio.astype(np.float32)
+
+    if KNF_AVAILABLE:
+        opts = knf.FbankOptions()
+        opts.frame_opts.dither = 0.0
+        opts.frame_opts.window_type = "hanning"
+        opts.frame_opts.frame_shift_ms = 10.0
+        opts.frame_opts.frame_length_ms = 25.0
+        opts.frame_opts.samp_freq = float(sr)
+        opts.frame_opts.snip_edges = True
+        opts.frame_opts.round_to_power_of_two = True
+        opts.mel_opts.num_bins = n_mels
+        opts.mel_opts.high_freq = float(sr) / 2.0
+        opts.mel_opts.low_freq = 20.0
+        opts.use_power = True
+        opts.use_log_fbank = True
+        fb = knf.OnlineFbank(opts)
+        fb.accept_waveform(sr, audio_f32.tolist())
+        fb.input_finished()
+        n_frames = fb.num_frames_ready
+        if n_frames == 0:
+            return np.zeros((n_mels, 1), dtype=np.float32)
+        features = np.array(
+            [fb.get_frame(i) for i in range(n_frames)], dtype=np.float32
+        ).T  # [n_mels, n_frames]
+    else:
+        # Scipy fallback ──────────────────────────────────────────────────────
+        win_len = int(0.025 * sr)   # 400 samples
+        hop_len = int(0.010 * sr)   # 160 samples
+        n_fft = 512
+        window = np.hanning(win_len).astype(np.float32)
+        n_frames = max(1, 1 + (len(audio_f32) - win_len) // hop_len)
+        frames = np.zeros((n_frames, n_fft), dtype=np.float32)
+        for i in range(n_frames):
+            s = i * hop_len
+            e = s + win_len
+            frame = audio_f32[s : min(e, len(audio_f32))]
+            if len(frame) < win_len:
+                frame = np.pad(frame, (0, win_len - len(frame)))
+            frames[i, :win_len] = frame * window
+        power = np.abs(np.fft.rfft(frames, n=n_fft, axis=-1)) ** 2  # [T, n_fft//2+1]
+        fb_matrix = _mel_filterbank(sr, n_fft, n_mels, fmin=20.0, fmax=sr / 2.0)
+        features = np.log(np.maximum(fb_matrix @ power.T, 1e-9)).astype(np.float32)
+        # features: [n_mels, n_frames]
+
+    # Per-feature (per-mel-bin) mean/std normalisation — matches sherpa-onnx NeMo impl
+    mean = features.mean(axis=-1, keepdims=True)
+    std = features.std(axis=-1, keepdims=True) + 1e-9
+    return ((features - mean) / std).astype(np.float32)
+
+
+def _extract_embeddings_ort(
+    emb_session,
+    samples: np.ndarray,
+    segments: list,
+    sr: int = SAMPLE_RATE,
+    n_mels: int = 80,
+    min_seg_s: float = 0.1,
+) -> tuple:
+    """
+    Extract L2-normalised TitaNet speaker embeddings for each segment.
+
+    Returns (embeddings [N, D], valid_segments) where valid_segments is the
+    subset of `segments` for which a valid embedding was obtained.
+    """
+    input_infos = emb_session.get_inputs()
+    inp_name = input_infos[0].name
+    has_length = len(input_infos) > 1
+    len_name = input_infos[1].name if has_length else None
+
+    valid_segs: list = []
+    embeds: list = []
+
+    for start_s, end_s, spk_id in segments:
+        if (end_s - start_s) < min_seg_s:
+            continue
+        s0 = max(0, int(start_s * sr))
+        s1 = min(len(samples), int(end_s * sr))
+        seg_audio = samples[s0:s1]
+        if len(seg_audio) < 1:
+            continue
+
+        mel = _compute_nemo_fbank(seg_audio, n_mels=n_mels, sr=sr)  # [n_mels, T]
+        T = mel.shape[-1]
+        if T < 2:
+            continue
+
+        feed = {inp_name: mel[np.newaxis, :, :]}  # [1, n_mels, T]
+        if has_length:
+            feed[len_name] = np.array([T], dtype=np.int64)
+
+        try:
+            out = emb_session.run(None, feed)
+        except Exception as exc:
+            log.warning(
+                "ORT embedding failed [%.2f-%.2f]: %s", start_s, end_s, exc
+            )
+            continue
+
+        emb = out[0][0] if out[0].ndim > 1 else out[0]  # [D]
+        norm = np.linalg.norm(emb)
+        if norm > 1e-9:
+            emb = emb / norm
+        valid_segs.append((start_s, end_s, spk_id))
+        embeds.append(emb.astype(np.float32))
+
+    if not embeds:
+        return np.zeros((0, 1), dtype=np.float32), []
+    return np.stack(embeds, axis=0), valid_segs
+
+
+def _fast_clustering(
+    embeddings: np.ndarray,
+    threshold: float = 0.5,
+    num_clusters: int = -1,
+) -> np.ndarray:
+    """
+    Centroid-linkage agglomerative clustering matching sherpa-onnx FastClustering.
+
+    Repeatedly merges the most cosine-similar pair until:
+      • threshold mode (num_clusters < 0): max similarity < threshold, OR
+      • fixed-count mode: exactly num_clusters remain.
+
+    All embeddings must be L2-normalised before calling.
+    Returns integer cluster labels [N].
+    """
+    N = len(embeddings)
+    if N == 0:
+        return np.array([], dtype=np.int32)
+    if N == 1:
+        return np.array([0], dtype=np.int32)
+
+    # Initial cosine-similarity matrix (dot product of unit vectors)
+    centroids = embeddings.copy().astype(np.float64)
+    sim = (centroids @ centroids.T).astype(np.float64)  # [N, N]
+    np.fill_diagonal(sim, -np.inf)
+
+    labels = np.arange(N, dtype=np.int32)
+    sizes = np.ones(N, dtype=np.int64)
+    active = np.ones(N, dtype=bool)
+
+    target = max(1, num_clusters) if num_clusters > 0 else 1
+    current_n = N
+
+    while current_n > target:
+        # Mask inactive rows/cols and find best merge candidate
+        active_idx = np.where(active)[0]
+        sub = sim[np.ix_(active_idx, active_idx)]
+        max_val = float(sub.max())
+
+        if num_clusters < 0 and max_val < threshold:
+            break
+
+        flat = np.argmax(sub)
+        i_loc, j_loc = np.unravel_index(flat, sub.shape)
+        i, j = int(active_idx[i_loc]), int(active_idx[j_loc])
+
+        # Merge j into i with weighted centroid
+        ni, nj = int(sizes[i]), int(sizes[j])
+        new_c = (ni * centroids[i] + nj * centroids[j]) / (ni + nj)
+        norm = np.linalg.norm(new_c)
+        if norm > 1e-9:
+            new_c /= norm
+        centroids[i] = new_c
+        sizes[i] = ni + nj
+
+        # Update entire column/row i in similarity matrix
+        col = centroids @ new_c  # [N] — similarity of every centroid to merged one
+        sim[i, :] = col
+        sim[:, i] = col
+        sim[i, i] = -np.inf
+
+        # Deactivate j
+        active[j] = False
+        sim[j, :] = -np.inf
+        sim[:, j] = -np.inf
+        labels[labels == j] = i
+        current_n -= 1
+
+    # Remap to contiguous 0-based labels
+    unique = sorted(set(labels.tolist()))
+    lmap = {old: new for new, old in enumerate(unique)}
+    return np.array([lmap[l] for l in labels.tolist()], dtype=np.int32)
+
+
+def run_diarization_ort(
+    samples: np.ndarray,
+    threshold: float,
+    num_speakers: Optional[int],
+    timing: dict,
+) -> tuple:
+    """
+    Full ORT diarization pipeline — drop-in replacement for
+    run_diarization_whole_day().
+
+    Stage 1: pyannote segmentation via ORT (CUDA if available)
+    Stage 2: TitaNet embedding extraction via ORT (CUDA if available)
+    Stage 3: FastClustering — pure numpy, CPU
+
+    Sets timing["diarization_provider"] = "CUDA" | "CPU (ort)".
+    """
+    seg_session, emb_session, provider = _get_ort_sessions()
+    timing["diarization_provider"] = provider
+
+    duration_s = len(samples) / SAMPLE_RATE
+    log.info(
+        "ORT diarization: %.0fs audio, provider=%s, threshold=%.2f, num_speakers=%s",
+        duration_s, provider, threshold, num_speakers,
+    )
+
+    # ── Read parameters from model metadata ──────────────────────────────────
+    seg_meta = seg_session.get_modelmeta().custom_metadata_map
+    emb_meta = emb_session.get_modelmeta().custom_metadata_map
+
+    window_size = int(seg_meta.get("window_size", "160000"))
+    # Use window_size as stride (non-overlapping) when metadata doesn't specify,
+    # matching sherpa-onnx offline mode behaviour.
+    window_shift = int(seg_meta.get("window_shift", str(window_size)))
+    model_num_speakers = int(seg_meta.get("num_speakers", "3"))
+    powerset_max = int(seg_meta.get("powerset_max_classes", "2"))
+    n_mels = int(
+        emb_meta.get("feature_dim", emb_meta.get("feat_dim", emb_meta.get("n_mels", "80")))
+    )
+    log.info(
+        "ORT params: window=%d shift=%d speakers=%d powerset_max=%d n_mels=%d",
+        window_size, window_shift, model_num_speakers, powerset_max, n_mels,
+    )
+
+    t_total = time.time()
+
+    # ── Stage 1: segmentation ─────────────────────────────────────────────────
+    t0 = time.time()
+    raw_segs = _run_pyannote_ort(
+        seg_session, samples, model_num_speakers, powerset_max,
+        window_size, window_shift,
+    )
+    timing["diarization_seg_s"] = round(time.time() - t0, 3)
+    log.info("ORT seg done: %d raw intervals in %.1fs", len(raw_segs), timing["diarization_seg_s"])
+
+    if not raw_segs:
+        timing["diarization_s"] = round(time.time() - t_total, 3)
+        return [], 0
+
+    # Pre-filter: remove segments below min_duration_on before embedding
+    cand_segs = [(s, e, spk) for s, e, spk in raw_segs if (e - s) >= MIN_DURATION_ON]
+    log.info("ORT: %d segments after min_duration_on filter", len(cand_segs))
+
+    # ── Stage 2: embedding extraction ────────────────────────────────────────
+    t0 = time.time()
+    embeddings, valid_segs = _extract_embeddings_ort(
+        emb_session, samples, cand_segs, n_mels=n_mels,
+    )
+    timing["diarization_emb_s"] = round(time.time() - t0, 3)
+    log.info(
+        "ORT emb done: %d/%d → shape=%s in %.1fs",
+        len(valid_segs), len(cand_segs), embeddings.shape, timing["diarization_emb_s"],
+    )
+
+    if len(valid_segs) == 0:
+        timing["diarization_s"] = round(time.time() - t_total, 3)
+        return [], 0
+
+    # ── Stage 3: FastClustering ───────────────────────────────────────────────
+    t0 = time.time()
+    n_clust = num_speakers if num_speakers is not None else -1
+    labels = _fast_clustering(embeddings, threshold=threshold, num_clusters=n_clust)
+    timing["diarization_clust_s"] = round(time.time() - t0, 3)
+    n_detected = len(set(labels.tolist()))
+    log.info(
+        "ORT clustering: %d segs → %d speakers in %.1fs",
+        len(valid_segs), n_detected, timing["diarization_clust_s"],
+    )
+
+    # ── Build output segments ─────────────────────────────────────────────────
+    out_segs = [
+        {
+            "start": round(s, 3),
+            "end": round(e, 3),
+            "speaker": f"speaker_{int(lbl):02d}",
+        }
+        for (s, e, _), lbl in zip(valid_segs, labels)
+    ]
+    out_segs.sort(key=lambda x: x["start"])
+
+    # Apply min_duration_off: merge short gaps between consecutive same-speaker segs
+    if out_segs:
+        merged: list = [out_segs[0]]
+        for seg in out_segs[1:]:
+            prev = merged[-1]
+            if (
+                seg["speaker"] == prev["speaker"]
+                and seg["start"] - prev["end"] < MIN_DURATION_OFF
+            ):
+                merged[-1] = {"start": prev["start"], "end": seg["end"], "speaker": prev["speaker"]}
+            else:
+                merged.append(seg)
+        out_segs = merged
+
+    elapsed = time.time() - t_total
+    timing["diarization_s"] = round(elapsed, 3)
+    num_speakers_detected = len({s["speaker"] for s in out_segs})
+
+    log.info(
+        "ORT diarization done: %.1fs | %d segs | %d speakers | RTF=%.3f | provider=%s",
+        elapsed, len(out_segs), num_speakers_detected, elapsed / max(duration_s, 1), provider,
+    )
+
+    try:
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        log.info("Peak RSS after ORT diarization: %.0f MB", rss_mb)
+    except Exception:
+        pass
+
+    return out_segs, num_speakers_detected
+
+
+# ── Sherpa-onnx diarization ────────────────────────────────────────────────────
 
 def _build_diarizer(
     threshold: float,
@@ -557,6 +1095,7 @@ def run_diarization_whole_day(
     result = diarizer.process(samples)
     elapsed = time.time() - t0
     timing["diarization_s"] = round(elapsed, 3)
+    timing["diarization_provider"] = "CPU (sherpa-onnx)"
 
     # Log peak RSS for RAM sizing decisions
     try:
@@ -874,10 +1413,24 @@ def handler(event: dict) -> dict:
         log.info("Loading WAV samples for diarization...")
         samples = load_wav_as_float32(concat_wav)
 
+        # Engine selection: ORT (CUDA if available) → sherpa-onnx CPU fallback
         if diarization_mode == "whole_day":
-            diarization_segments, num_speakers_detected = run_diarization_whole_day(
-                samples, cluster_threshold, num_speakers, timing,
-            )
+            if ORT_AVAILABLE:
+                try:
+                    diarization_segments, num_speakers_detected = run_diarization_ort(
+                        samples, cluster_threshold, num_speakers, timing,
+                    )
+                except Exception as ort_exc:
+                    log.warning(
+                        "ORT diarization failed (%s) — falling back to sherpa-onnx", ort_exc
+                    )
+                    diarization_segments, num_speakers_detected = run_diarization_whole_day(
+                        samples, cluster_threshold, num_speakers, timing,
+                    )
+            else:
+                diarization_segments, num_speakers_detected = run_diarization_whole_day(
+                    samples, cluster_threshold, num_speakers, timing,
+                )
         else:
             diarization_segments, num_speakers_detected = run_diarization_fixed_chunk(
                 samples, cluster_threshold, num_speakers, timing,

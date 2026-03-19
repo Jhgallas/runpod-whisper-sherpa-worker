@@ -1,8 +1,13 @@
-# RunPod Parity Worker — whisper.cpp + Sherpa ONNX equivalent
-# ─────────────────────────────────────────────────────────────
+# RunPod Parity Worker — whisper.cpp + Sherpa ONNX + ORT CUDA equivalent
+# ─────────────────────────────────────────────────────────────────────────
 # GPU-accelerated: CUDA 12.1 runtime base provides libcublas.so.12 and cuDNN 8
-# so ctranslate2 (faster-whisper) can use the GPU automatically at runtime.
-# Diarization (sherpa-onnx / onnxruntime) runs on CPU.
+# so ctranslate2 (faster-whisper) uses GPU automatically at runtime.
+#
+# Diarization engine priority:
+#   1. onnxruntime-gpu:
+#        - CUDAExecutionProvider if GPU supports it (Kepler+ / sm_37+)
+#        - Falls back to CPUExecutionProvider transparently
+#   2. sherpa-onnx CPU fallback (statically-linked CPU onnxruntime inside)
 #
 # Build prerequisites — populate models/ in the build context:
 #   Option A (recommended): copy from Android assets
@@ -49,7 +54,8 @@ RUN uv pip install --system --no-cache-dir \
 RUN uv pip install --system --no-cache-dir \
     "faster-whisper>=1.0.0" \
     "sherpa-onnx>=1.12.0" \
-    "onnxruntime>=1.18.0" \
+    "onnxruntime-gpu>=1.18.0" \
+    "kaldi-native-fbank>=1.17" \
     runpod \
     requests \
     soundfile \
