@@ -442,7 +442,8 @@ def transcribe_audio(
         })
 
     elapsed = time.time() - t0
-    timing["transcription_s"] = round(elapsed, 3)
+    model_key = model_size.replace(".", "_")
+    timing[f"transcription_{model_key}_s"] = round(elapsed, 3)
     log.info(
         "Transcription done in %.1fs — %d segments, detected=%s (p=%.2f)",
         elapsed, len(transcript_lines), info.language, info.language_probability,
@@ -756,33 +757,44 @@ def handler(event: dict) -> dict:
         return {"error": "Either 'audio_url' or 'audio_urls' input is required."}
 
     ext: str = inp.get("ext", "opus")
-    language_input: Optional[str] = inp.get("language")            # None or "auto" = auto-detect
+    language_input: Optional[str] = inp.get("language")
     language_candidates: list[str] = inp.get("language_candidates", ["en", "pt"])
-    model_size: str = inp.get("model_size", "base.en")
+
+    # model_sizes (array) is canonical; model_size (string) is a convenience alias.
+    # Default: ["base.en", "small.en"] — both always run unless caller restricts.
+    if "model_sizes" in inp:
+        model_sizes: list[str] = list(inp["model_sizes"])
+    elif "model_size" in inp:
+        model_sizes = [str(inp["model_size"])]
+    else:
+        model_sizes = ["base.en", "small.en"]
+
+    if not model_sizes:
+        return {"error": "'model_sizes' must be a non-empty array."}
+
     cluster_threshold: float = float(inp.get("cluster_threshold", DEFAULT_THRESHOLD))
-    num_speakers: Optional[int] = inp.get("num_speakers")          # None = auto-detect
+    num_speakers: Optional[int] = inp.get("num_speakers")
     diarization_mode: str = inp.get("diarization_mode", "whole_day")
     recording_id: str = inp.get("recording_id", "recording")
     gist_token: str = inp.get("gist_token", "")
 
     log.info(
-        "Params: recording_id=%s model=%s language=%s files=%d mode=%s",
-        recording_id, model_size, language_input, len(audio_urls), diarization_mode,
+        "Params: recording_id=%s models=%s language=%s files=%d mode=%s",
+        recording_id, model_sizes, language_input, len(audio_urls), diarization_mode,
     )
 
     if diarization_mode not in ("whole_day", "fixed_chunk"):
         return {
             "error": f"Unknown diarization_mode '{diarization_mode}'.",
-            "detail": "Supported modes: 'whole_day' (default), 'fixed_chunk'. "
-                      "'vad_silence_chunk' is deferred (not yet implemented).",
+            "detail": "Supported modes: 'whole_day' (default), 'fixed_chunk'.",
         }
 
     # ── Gist pre-flight (mandatory — refuse to run without it) ───────────────
     if not gist_token:
         return {
             "error": "Gist connectivity check failed",
-            "detail": "gist_token is required in input. The worker uploads all results "
-                      "to Gist and will refuse to process audio without a valid token.",
+            "detail": "gist_token is required. The worker uploads all results to Gist "
+                      "and will refuse to process audio without a valid token.",
         }
     try:
         verify_gist_upload(gist_token)
@@ -818,83 +830,98 @@ def handler(event: dict) -> dict:
             os.path.getsize(concat_wav) / (1024 * 1024), timing["audio_concat_s"],
         )
 
-        # Language detection
-        model = get_whisper_model(model_size)
+        # Audio duration for RTF calculations
+        wav_meta = get_file_metadata(concat_wav)
+        audio_duration_s = wav_meta.get("duration_s") or sum(file_durations_s) or 1.0
+        log.info("Audio duration: %.0fs (%.1f min)", audio_duration_s, audio_duration_s / 60)
+
+        # Language detection — use first model in list; result shared across all models
+        first_model = model_sizes[0]
         t0 = time.time()
         if language_input is None or language_input == "auto":
             detected_language, lang_confidence = detect_constrained_language(
-                concat_wav, model,
+                concat_wav, get_whisper_model(first_model),
                 candidates=language_candidates,
                 fallback=language_candidates[0] if language_candidates else "en",
             )
         elif "," in language_input:
-            # Comma-joined multi-language setting (e.g. "en,pt") — constrained detect
             candidates = [c.strip() for c in language_input.split(",")]
             detected_language, lang_confidence = detect_constrained_language(
-                concat_wav, model,
+                concat_wav, get_whisper_model(first_model),
                 candidates=candidates,
                 fallback=candidates[0],
             )
         else:
-            # Fixed single language — no detection pass needed
             detected_language = language_input
             lang_confidence = 1.0
         timing["language_detection_s"] = round(time.time() - t0, 3)
+        log.info("Language: %s (p=%.2f)", detected_language, lang_confidence)
 
-        # Transcription
-        transcript_lines, segment_metadata, _, _ = transcribe_audio(
-            concat_wav, model_size, detected_language, timing,
-        )
+        # ── Transcription — one pass per model ───────────────────────────────
+        per_model: dict[str, dict] = {}  # keyed by model_size string
+        for ms in model_sizes:
+            log.info("--- Transcribing with model: %s ---", ms)
+            t_lines, seg_meta, _, _ = transcribe_audio(
+                concat_wav, ms, detected_language, timing,
+            )
+            per_model[ms] = {
+                "transcript_lines": t_lines,
+                "segment_metadata": seg_meta,
+            }
+            log.info("  %s: %d lines", ms, len(t_lines))
 
-        # Audio duration for RTF
-        wav_meta = get_file_metadata(concat_wav)
-        timing["metadata_extraction_s"] = 0.0  # extracted inline above
-        audio_duration_s = wav_meta.get("duration_s") or sum(file_durations_s) or 1.0
-        log.info(
-            "Audio duration: %.0fs (%.1f min), transcript: %d lines",
-            audio_duration_s, audio_duration_s / 60, len(transcript_lines),
-        )
-
-        # Load WAV as float32 for sherpa_onnx
+        # ── Diarization — once, shared across all models ──────────────────────
+        log.info("Loading WAV samples for diarization...")
         samples = load_wav_as_float32(concat_wav)
 
-        # Diarization
         if diarization_mode == "whole_day":
             diarization_segments, num_speakers_detected = run_diarization_whole_day(
                 samples, cluster_threshold, num_speakers, timing,
             )
-        else:  # fixed_chunk
+        else:
             diarization_segments, num_speakers_detected = run_diarization_fixed_chunk(
                 samples, cluster_threshold, num_speakers, timing,
             )
 
-        del samples  # release RAM before Gist upload
+        del samples  # release RAM before alignment + Gist upload
 
-        # Speaker alignment
-        t0 = time.time()
-        labeled_lines = assign_speakers_to_lines(transcript_lines, diarization_segments, audio_duration_s)
-        timing["alignment_s"] = round(time.time() - t0, 3)
-        log.info("Alignment done in %.3fs", timing["alignment_s"])
+        # ── Per-model alignment, language flags, formatted artifacts ─────────
+        gist_files: dict[str, str] = {}
 
-        # Language flags
-        t0 = time.time()
-        effective_target_for_flags = detected_language if (language_input and language_input != "auto") else None
-        language_flags = compute_language_flags(
-            transcript_lines, effective_target_for_flags, model_size,
-        )
-        timing["language_flags_s"] = round(time.time() - t0, 3)
+        for ms in model_sizes:
+            model_key = ms.replace(".", "_")
+            t_lines = per_model[ms]["transcript_lines"]
+            seg_meta = per_model[ms]["segment_metadata"]
 
-        # ── Format output artifacts ───────────────────────────────────────────
+            # Speaker alignment
+            t0 = time.time()
+            labeled_lines = assign_speakers_to_lines(t_lines, diarization_segments, audio_duration_s)
+            timing[f"alignment_{model_key}_s"] = round(time.time() - t0, 3)
 
-        # Transcript: [HH:MM:SS]  text  (TWO spaces — parser-significant in GeminiService.kt)
-        transcript_text = "\n".join(
-            f"{line['timestamp_str']}  {line['text']}" for line in transcript_lines
-        )
+            # Language flags
+            t0 = time.time()
+            effective_target = detected_language if (language_input and language_input != "auto") else None
+            lang_flags = compute_language_flags(t_lines, effective_target, ms)
+            timing[f"language_flags_{model_key}_s"] = round(time.time() - t0, 3)
 
-        # Labeled transcript: [HH:MM:SS] speaker_XX: text
-        labeled_transcript_text = "\n".join(labeled_lines)
+            # Format transcript: [HH:MM:SS]  text  (TWO spaces — parser-significant)
+            transcript_text = "\n".join(
+                f"{line['timestamp_str']}  {line['text']}" for line in t_lines
+            )
+            labeled_text = "\n".join(labeled_lines)
 
-        # Diarization JSON
+            # Store formatted artifacts for response and Gist
+            per_model[ms]["transcript_text"] = transcript_text
+            per_model[ms]["labeled_text"] = labeled_text
+            per_model[ms]["lang_flags"] = lang_flags
+
+            # Gist files for this model
+            gist_files[f"{recording_id}_transcript_{ms}.txt"] = transcript_text
+            gist_files[f"{recording_id}_labeled_{ms}.txt"] = labeled_text
+            gist_files[f"{recording_id}_segment_metadata_{ms}.json"] = json.dumps(seg_meta, indent=2)
+            gist_files[f"{recording_id}_language_flags_{ms}.json"] = json.dumps(lang_flags, indent=2)
+
+        # Diarization JSON — shared, one copy per Gist
         diarization_json_obj = {
             "segments": diarization_segments,
             "num_speakers": num_speakers_detected,
@@ -902,16 +929,22 @@ def handler(event: dict) -> dict:
             "model": "pyannote-seg-3.0_titanet-small",
             "mode": diarization_mode,
         }
+        gist_files[f"{recording_id}_diarization.json"] = json.dumps(diarization_json_obj, indent=2)
 
         # RTF and totals
         total_s = time.time() - job_start
         timing["total_s"] = round(total_s, 3)
-        timing["rtf_transcription"] = round(timing.get("transcription_s", 0) / audio_duration_s, 4)
+        for ms in model_sizes:
+            model_key = ms.replace(".", "_")
+            tkey = f"transcription_{model_key}_s"
+            timing[f"rtf_transcription_{model_key}"] = round(
+                timing.get(tkey, 0) / audio_duration_s, 4
+            )
         timing["rtf_total"] = round(total_s / audio_duration_s, 4)
 
         run_summary = {
             "recording_id": recording_id,
-            "model_size": model_size,
+            "model_sizes": model_sizes,
             "detected_language": detected_language,
             "language_probability": round(lang_confidence, 4),
             "audio_duration_s": round(audio_duration_s, 2),
@@ -921,71 +954,74 @@ def handler(event: dict) -> dict:
             "num_speakers": num_speakers_detected,
             "cluster_threshold": cluster_threshold,
             "diarization_mode": diarization_mode,
-            "transcript_lines": len(transcript_lines),
             "cpu_only": CPU_ONLY,
             "timing": timing,
             "sherpa_onnx_version": getattr(sherpa_onnx, "__version__", "unknown") if SHERPA_AVAILABLE else "unavailable",
         }
+        gist_files[f"{recording_id}_run_summary.json"] = json.dumps(run_summary, indent=2)
 
         log.info(
-            "Total: %.0fs | RTF transcription: %.3fx | RTF total: %.3fx",
-            total_s, timing["rtf_transcription"], timing["rtf_total"],
+            "Total: %.0fs | diarization: %.0fs | RTF total: %.3fx",
+            total_s, timing.get("diarization_s", 0), timing["rtf_total"],
         )
 
         # ── Gist upload ────────────────────────────────────────────────────────
         today = datetime.date.today().isoformat()
-        gist_description = f"{recording_id}_{model_size}_{today}"
-        gist_files = {
-            f"{recording_id}_transcript_{model_size}.txt": transcript_text,
-            f"{recording_id}_diarization.json": json.dumps(diarization_json_obj, indent=2),
-            f"{recording_id}_labeled_{model_size}.txt": labeled_transcript_text,
-            f"{recording_id}_segment_metadata_{model_size}.json": json.dumps(segment_metadata, indent=2),
-            f"{recording_id}_language_flags_{model_size}.json": json.dumps(language_flags, indent=2),
-            f"{recording_id}_run_summary.json": json.dumps(run_summary, indent=2),
-        }
+        gist_description = f"{recording_id}_{today}"
+        gist_url = ""
 
         try:
             gist_url = upload_to_gist(gist_token, gist_files, gist_description, timing)
         except Exception as exc:
             log.error("Gist upload failed after retries: %s", exc)
-            # Embed raw data in response so caller can recover without re-running
-            return {
+            # Embed raw artifacts so caller can recover without re-running
+            recovery = {
                 "error": "Gist upload failed",
                 "detail": str(exc),
                 "recording_id": recording_id,
-                "model_size": model_size,
+                "model_sizes": model_sizes,
                 "detected_language": detected_language,
                 "language_probability": round(lang_confidence, 4),
                 "audio_duration_s": round(audio_duration_s, 2),
                 "file_durations_s": [round(d, 2) for d in file_durations_s],
-                "transcript_lines": len(transcript_lines),
                 "num_speakers": num_speakers_detected,
                 "cluster_threshold": cluster_threshold,
                 "timing": timing,
                 "cpu_only": CPU_ONLY,
-                # Raw artifacts for manual recovery
-                "transcript": transcript_text,
                 "diarization_segments": diarization_segments,
-                "labeled_transcript": labeled_transcript_text,
+                "models": {},
             }
+            for ms in model_sizes:
+                recovery["models"][ms] = {
+                    "transcript_lines": len(per_model[ms]["transcript_lines"]),
+                    "transcript": per_model[ms]["transcript_text"],
+                    "labeled_transcript": per_model[ms]["labeled_text"],
+                }
+            return recovery
 
     # ── Response ───────────────────────────────────────────────────────────────
+    models_out: dict[str, dict] = {}
+    for ms in model_sizes:
+        models_out[ms] = {
+            "transcript_lines": len(per_model[ms]["transcript_lines"]),
+            "transcript": per_model[ms]["transcript_text"],
+            "labeled_transcript": per_model[ms]["labeled_text"],
+        }
+
     return {
         "recording_id": recording_id,
-        "model_size": model_size,
+        "model_sizes": model_sizes,
         "detected_language": detected_language,
         "language_probability": round(lang_confidence, 4),
-        "transcript_lines": len(transcript_lines),
         "num_speakers": num_speakers_detected,
         "cluster_threshold": cluster_threshold,
         "audio_duration_s": round(audio_duration_s, 2),
         "file_durations_s": [round(d, 2) for d in file_durations_s],
-        "processing_time_s": round(total_s, 2),
         "cpu_only": CPU_ONLY,
         "gist_url": gist_url,
-        "transcript": transcript_text,
         "diarization_segments": diarization_segments,
-        "labeled_transcript": labeled_transcript_text,
+        "models": models_out,
+        "timing": timing,
     }
 
 
