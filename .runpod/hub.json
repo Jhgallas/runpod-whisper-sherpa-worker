@@ -1,0 +1,22 @@
+{
+  "title": "Whisper Diarization Worker",
+  "description": "Serverless worker for audio transcription with speaker diarization using OpenAI's Whisper model. Supports automatic GPU/CPU detection and base64 audio input.",
+  "type": "serverless",
+  "category": "language",
+  "iconUrl": "https://dummyimage.com/100x100/5733ff/fff&text=WD",
+  "config": {
+    "runsOn": "GPU",
+    "containerDiskInGb": 15,
+    "gpuIds": "NVIDIA L40",
+    "gpuCount": 1,
+    "allowedCudaVersions": [
+      "12.7",
+      "12.6",
+      "12.5",
+      "12.4",
+      "12.3",
+      "12.2",
+      "12.1"
+    ]
+  }
+}

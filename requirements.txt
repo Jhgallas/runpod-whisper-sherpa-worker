@@ -1,0 +1,21 @@
+# RunPod Parity Worker — Python dependencies
+# Use for local testing only. The Dockerfile installs its own pinned set.
+#
+# Install:
+#   pip install -r requirements.txt
+#
+# Note: torch CPU version is sufficient for local testing; faster-whisper /
+# ctranslate2 handles GPU detection independently at runtime.
+
+faster-whisper>=1.0.0
+sherpa-onnx>=1.12.0
+onnxruntime>=1.18.0
+runpod
+requests
+soundfile
+numpy<2.0
+langdetect
+
+# CPU torch for device detection fallback
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch

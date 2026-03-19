@@ -1,0 +1,14 @@
+{
+    "input": {
+        "audio_url": "https://example.com/recording.opus",
+        "ext": "opus",
+        "language": "en",
+        "language_candidates": ["en", "pt"],
+        "model_size": "base.en",
+        "cluster_threshold": 0.5,
+        "num_speakers": null,
+        "diarization_mode": "whole_day",
+        "recording_id": "2026-03-19",
+        "gist_token": "ghp_YOUR_TOKEN_HERE"
+    }
+}
