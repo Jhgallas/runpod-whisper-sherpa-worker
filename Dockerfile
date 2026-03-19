@@ -1,8 +1,8 @@
 # RunPod Parity Worker — whisper.cpp + Sherpa ONNX equivalent
 # ─────────────────────────────────────────────────────────────
-# CPU-first design: inference runs on CPU by default.
-# GPU acceleration is used automatically at runtime if CUDA is present
-# (faster-whisper / ctranslate2 detects CUDA without CUDA base image).
+# GPU-accelerated: CUDA 12.1 runtime base provides libcublas.so.12 and cuDNN 8
+# so ctranslate2 (faster-whisper) can use the GPU automatically at runtime.
+# Diarization (sherpa-onnx / onnxruntime) runs on CPU.
 #
 # Build prerequisites — populate models/ in the build context:
 #   Option A (recommended): copy from Android assets
@@ -16,7 +16,7 @@
 #   cd runpod-worker-whisper-diarization-master
 #   docker build -t whisper-parity-worker .
 
-FROM ubuntu:22.04
+FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
 # Prevent interactive prompts during apt install
 ENV DEBIAN_FRONTEND=noninteractive
@@ -41,10 +41,10 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:$PATH"
 
 # ── Python dependencies ────────────────────────────────────────────────────────
-# torch CPU-only — used for device detection fallback only
-# ctranslate2 (bundled with faster-whisper) handles GPU inference independently
+# torch with CUDA 12.1 — needed for torch.cuda.is_available() detection
+# ctranslate2 (bundled with faster-whisper) handles GPU inference via libcublas
 RUN uv pip install --system --no-cache-dir \
-    torch --index-url https://download.pytorch.org/whl/cpu
+    torch --index-url https://download.pytorch.org/whl/cu121
 
 RUN uv pip install --system --no-cache-dir \
     "faster-whisper>=1.0.0" \
@@ -59,12 +59,13 @@ RUN uv pip install --system --no-cache-dir \
 # ── Bake Whisper models (downloads at build time → baked into image layer) ─────
 # Models are cached to /app/whisper_models to avoid runtime downloads.
 ENV WHISPER_CACHE_DIR=/app/whisper_models
+# Force device=cpu at build time — build machines have no GPU
 RUN python3 -c "from faster_whisper import WhisperModel; \
-    WhisperModel('tiny.en', download_root='/app/whisper_models')"
+    WhisperModel('tiny.en', device='cpu', download_root='/app/whisper_models')"
 RUN python3 -c "from faster_whisper import WhisperModel; \
-    WhisperModel('base.en', download_root='/app/whisper_models')"
+    WhisperModel('base.en', device='cpu', download_root='/app/whisper_models')"
 RUN python3 -c "from faster_whisper import WhisperModel; \
-    WhisperModel('small.en', download_root='/app/whisper_models')"
+    WhisperModel('small.en', device='cpu', download_root='/app/whisper_models')"}
 
 # ── Diarization ONNX models ────────────────────────────────────────────────────
 # Source: app/src/main/assets/diarization/ (or downloaded via prepare_models.sh)
