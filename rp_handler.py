@@ -98,6 +98,21 @@ MIN_DURATION_ON: float = 0.3    # minDurationOn
 MIN_DURATION_OFF: float = 0.5   # minDurationOff
 DEFAULT_THRESHOLD: float = 0.5  # confirmed best for C1 combination
 
+# Set DIARIZATION_DEBUG=1 to enable extra assertions (L2 norm check) in the ORT path.
+DIARIZATION_DEBUG: bool = os.environ.get("DIARIZATION_DEBUG", "0") == "1"
+
+# Per-hour GPU prices on RunPod serverless (used for cost_estimate_usd in run_summary).
+# Source: https://www.runpod.io/serverless-gpu-pricing — check periodically.
+GPU_PRICE_PER_HOUR: dict = {
+    "NVIDIA GeForce RTX 4090": 0.59,
+    "NVIDIA RTX A5000": 0.58,
+    "NVIDIA L4": 0.58,
+    "NVIDIA RTX 3090": 0.58,
+    "NVIDIA A100": 1.99,
+    "NVIDIA L40S": 1.22,
+    "NVIDIA H100": 3.49,
+}
+
 # Android OOM threshold: 40 M samples ≈ 41.7 min at 16 kHz
 FIXED_CHUNK_SAMPLES: int = 40_000_000
 
@@ -195,6 +210,40 @@ def _get_worker_info() -> dict:
 
 WORKER_INFO: dict = _get_worker_info()
 log.info("Worker info: %s", WORKER_INFO)
+
+
+def _log_vram(label: str) -> None:
+    """Log current VRAM utilisation via nvidia-smi (best-effort, no-op on CPU)."""
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.free,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            log.info("VRAM [%s]: %s (used/free/total MiB)", label, r.stdout.strip())
+    except Exception:
+        pass
+
+
+def _estimate_cost(pipeline_s: float) -> Optional[float]:
+    """
+    Return a USD cost estimate using pipeline_s as a proxy for billed executionTime.
+
+    Uses the GPU name captured in WORKER_INFO at startup against GPU_PRICE_PER_HOUR.
+    Returns None when the GPU model is not in the table — log the GPU name so the
+    caller can look it up manually.
+    """
+    gpus = WORKER_INFO.get("gpus", [])
+    if not gpus:
+        return None
+    gpu_name = gpus[0].get("name", "")
+    price = GPU_PRICE_PER_HOUR.get(gpu_name)
+    if price is None:
+        log.warning("GPU '%s' not in GPU_PRICE_PER_HOUR — cost_estimate_usd=null", gpu_name)
+        return None
+    return round((pipeline_s / 3600.0) * price, 4)
+
 
 # ── Lazily-cached Whisper models (loaded once per worker process) ──────────────
 
@@ -547,6 +596,14 @@ _ort_emb_session = None
 _ort_provider: Optional[str] = None
 
 
+def _release_ort_sessions() -> None:
+    """Reset cached ORT sessions so VRAM is freed. Sessions reload on next call."""
+    global _ort_seg_session, _ort_emb_session, _ort_provider
+    _ort_seg_session = None
+    _ort_emb_session = None
+    _ort_provider = None
+
+
 def _ort_cuda_available() -> bool:
     """Return True if onnxruntime CUDAExecutionProvider is accessible."""
     if not ORT_AVAILABLE:
@@ -886,14 +943,23 @@ def _extract_embeddings_ort(
 
         emb = out[0][0] if out[0].ndim > 1 else out[0]  # [D]
         norm = np.linalg.norm(emb)
-        if norm > 1e-9:
+        if norm > 1e-8:  # 1e-8 matches sherpa-onnx C++ epsilon (was 1e-9)
             emb = emb / norm
         valid_segs.append((start_s, end_s, spk_id))
         embeds.append(emb.astype(np.float32))
 
     if not embeds:
         return np.zeros((0, 1), dtype=np.float32), []
-    return np.stack(embeds, axis=0), valid_segs
+    result = np.stack(embeds, axis=0)
+    if DIARIZATION_DEBUG:
+        norms = np.linalg.norm(result, axis=1)
+        if not np.allclose(norms, 1.0, atol=1e-5):
+            log.error(
+                "L2 normalisation check FAILED: min=%.6f max=%.6f mean=%.6f "
+                "— embeddings may not be unit-normalised (set DIARIZATION_DEBUG=0 to suppress)",
+                norms.min(), norms.max(), norms.mean(),
+            )
+    return result, valid_segs
 
 
 def _fast_clustering(
@@ -1516,6 +1582,17 @@ def handler(event: dict) -> dict:
             log.info("  %s: %d lines", ms, len(t_lines))
 
         # ── Diarization — once, shared across all models ──────────────────────
+        # Transcription is complete. Free cached Whisper models from VRAM before
+        # loading ORT diarization sessions, reducing peak VRAM pressure.
+        if not CPU_ONLY:
+            _log_vram("pre-diarization (whisper cached)")
+            _whisper_cache.clear()
+            try:
+                import torch as _torch
+                _torch.cuda.empty_cache()
+            except Exception:
+                pass
+            _log_vram("pre-diarization (whisper freed)")
         log.info("Loading WAV samples for diarization...")
         samples = load_wav_as_float32(concat_wav)
 
@@ -1543,6 +1620,17 @@ def handler(event: dict) -> dict:
             )
 
         del samples  # release RAM before alignment + Gist upload
+
+        # Diarization complete. Release ORT sessions from VRAM.
+        if not CPU_ONLY:
+            _log_vram("post-diarization (ort loaded)")
+            _release_ort_sessions()
+            try:
+                import torch as _torch
+                _torch.cuda.empty_cache()
+            except Exception:
+                pass
+            _log_vram("post-diarization (ort freed)")
 
         # ── Per-model alignment, language flags, formatted artifacts ─────────
         gist_files: dict[str, str] = {}
@@ -1617,6 +1705,7 @@ def handler(event: dict) -> dict:
             "timing": timing,
             "job_id": job_id,
             "worker": WORKER_INFO,
+            "cost_estimate_usd": _estimate_cost(total_s),
             "sherpa_onnx_version": getattr(sherpa_onnx, "__version__", "unknown") if SHERPA_AVAILABLE else "unavailable",
         }
         gist_files[f"{recording_id}_run_summary.json"] = json.dumps(run_summary, indent=2)

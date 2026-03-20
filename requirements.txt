@@ -16,6 +16,9 @@ soundfile
 numpy<2.0
 langdetect
 
+# GCS upload helper (used by validate_gold01.sh / gcs_upload.py — not loaded in RunPod worker)
+google-cloud-storage>=2.14.0
+
 # CPU torch for device detection fallback
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
